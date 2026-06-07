@@ -1,0 +1,9 @@
+{
+  "hashedPassword": "$6$mi6q2/GQ/hyIksXd$SJYOKrzY1BCmsXqNnr0q1aGRFIFfYKQzKbNffPNI6JYU6JIvg5QFXuTXFwepzrTyD5Et0JT3BRUqYtoqEBDSC0",
+  "publicKey": {
+    "keys": [
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBts34MjDkR3HZeR5+CE4uJowfrTQEfU59hFzNMhzwKw sayo"
+    ]
+  },
+  "control": "d90f62fa-c5cd-4581-8818-d61fd761a7d6"
+}

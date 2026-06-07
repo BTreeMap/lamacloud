@@ -1,0 +1,10 @@
+{
+  "elaina": {
+    "hashedPassword": "$6$u9w.AhTJgHfxOH9z$45cy1qzzYvdk93z5utWGMVEYljKyyZC9izx/BFhG8hqJQMFZQK8gJuTZaP.bjq/3FAIZBB0dDWpLUTIueBAO6/",
+    "publicKey": {
+      "keys": [
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFtZte/jKY6Bt8xRmXjgkVWZdObD/2a+SzbLq0IL3byb elaina@hk01"
+      ]
+    }
+  }
+}

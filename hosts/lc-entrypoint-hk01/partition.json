@@ -1,0 +1,19 @@
+{
+  "/dev/disk/by-id/virtio-j6c0q4b3lxk6zk1n58z5": {
+    "p1": {
+      "type": "vfat",
+      "size": "512M",
+      "role": "boot"
+    },
+    "p2": {
+      "type": "ext4",
+      "size": "-2G",
+      "role": "rootfs"
+    },
+    "p3": {
+      "type": "swap",
+      "size": "100%",
+      "role": "swap"
+    }
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "name": "lc-foundation-scripts",
+  "version": "1.0.0",
+  "description": "",
+  "main": "lamacloud",
+  "scripts": {},
+  "keywords": [],
+  "author": "",
+  "license": "Anti-996",
+  "packageManager": "pnpm@10.28.0",
+  "dependencies": {
+    "commander": "^15.0.0",
+    "prompts": "^2.4.2",
+    "zx": "^8.8.5"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.1"
+  }
+}
