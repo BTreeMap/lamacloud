@@ -6,7 +6,12 @@
   packages = with pkgs; [
     serverctl
     nodejs nginx certbot
+    ethtool
   ];
+
+  services.udev.extraRules = ''
+    ACTION=="add", SUBSYSTEM=="net", KERNEL=="en*|eth*", RUN+="${pkgs.ethtool}/bin/ethtool -K %k rx-udp-gro-forwarding on rx-gro-list off"
+  '';
 
   boot.kernel.sysctl = {
     "net.core.default_qdisc" = "fq";
