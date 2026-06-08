@@ -1,0 +1,9 @@
+{
+    "hashedPassword": "$6$i/FQksE6taHeNzBa$YZpK.N2nv1iIrTjJW1vNtH6SA2HrK75nD1zEP0jqfcPXlPD6xmzfnHFGtbH4qSI8TUgtoqzKKHAWyQj9ToPK/.",
+    "publicKey": {
+        "keys": [
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHB+9o3584ku+1BbOqZPsMDhyN6E0nPLbus6vVV30j2v sayo@lamacloud-ci-fixture"
+        ]
+    },
+    "control": "00000000-0000-4000-8000-000000000001"
+}

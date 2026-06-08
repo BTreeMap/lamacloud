@@ -1,0 +1,155 @@
+name: ci
+
+# Fast feedback loop for every push and PR.
+#
+# Stages:
+#   1. cli-suite    -- exercise every lamacloud CLI subcommand using fixtures
+#   2. flake-check  -- nix flake check + Colmena introspect
+#   3. colmena-build-x86 -- Colmena build of the lc-ci-fixture (x86_64 only)
+#
+# The slower full hive + aarch64 build runs in the dedicated `aarch64-build`
+# job below, which is gated on the fast jobs passing. The actual VM deploy
+# lives in e2e-deploy.yml.
+
+on:
+  push:
+    branches: ['master', 'main', 'feat/**']
+  pull_request:
+    branches: ['master', 'main']
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  # ------------------------------------------------------------------ JS layer
+  cli-suite:
+    name: CLI suite (no nix required)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.28.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+          cache-dependency-path: foundation/scripts/pnpm-lock.yaml
+
+      - name: Install JS dependencies
+        working-directory: foundation/scripts
+        run: pnpm install --frozen-lockfile
+
+      - name: Install CI fixtures
+        env:
+          LAMACLOUD_CI: '1'
+        run: ./tests/e2e/install-fixtures.sh
+
+      - name: Run CLI suite
+        run: ./tests/e2e/cli-suite.sh
+
+      - name: Restore real configuration files
+        if: always()
+        run: ./tests/e2e/restore-fixtures.sh
+
+  # --------------------------------------------------------------- Nix evaluation
+  flake-check:
+    name: Nix flake check
+    runs-on: ubuntu-24.04
+    needs: cli-suite
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+
+      - name: Install CI fixtures
+        env:
+          LAMACLOUD_CI: '1'
+        run: ./tests/e2e/install-fixtures.sh
+
+      - name: nix flake metadata (info banner)
+        run: nix flake metadata
+
+      - name: nix flake check
+        run: nix flake check --no-build --show-trace
+
+  # --------------------------------------------------------------- Colmena build x86
+  colmena-build-x86:
+    name: Colmena build (lc-ci-fixture)
+    runs-on: ubuntu-24.04
+    needs: flake-check
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+
+      - name: Install CI fixtures
+        env:
+          LAMACLOUD_CI: '1'
+        run: ./tests/e2e/install-fixtures.sh
+
+      - name: Provide colmena in PATH (from our flake input)
+        run: |
+          echo "==> installing colmena built from the pinned flake input"
+          nix profile install .#colmena
+          which colmena
+          colmena --version
+
+      - name: Run colmena-build.sh (lc-ci-fixture)
+        env:
+          LC_BUILD_TARGET: lc-ci-fixture
+        run: ./tests/e2e/colmena-build.sh
+
+  # --------------------------------------------------------------- aarch64 hosts
+  colmena-build-aarch64:
+    name: Colmena build (aarch64 hosts via binfmt)
+    runs-on: ubuntu-24.04
+    needs: colmena-build-x86
+    # Failure of cross-arch builds should not block the PR if all other
+    # signals are green; gate on a workflow-level boolean instead.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Register binfmt for aarch64 (qemu-user-static)
+        run: |
+          echo "==> installing aarch64 binfmt handler"
+          docker run --rm --privileged tonistiigi/binfmt --install arm64
+          ls /proc/sys/fs/binfmt_misc/ | grep -i aarch64 || true
+
+      - name: Install Nix (extra-platforms aarch64)
+        uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+            extra-platforms = aarch64-linux
+
+      - name: Install CI fixtures
+        env:
+          LAMACLOUD_CI: '1'
+        run: ./tests/e2e/install-fixtures.sh
+
+      - name: Provide colmena in PATH (from our flake input)
+        run: nix profile install .#colmena
+
+      - name: Build every host in the hive (slow)
+        env:
+          LC_BUILD_TARGET: '@lamacloud'
+        run: ./tests/e2e/colmena-build.sh

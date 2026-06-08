@@ -1,27 +1,32 @@
-({ nixpkgs, disko, ... }: let 
+({ nixpkgs, disko, ... }: let
   aliasFactory = import ./alias.nix { inherit nixpkgs; };
   lib = nixpkgs.lib;
-in 
+in
 rec {
-  flattenAttrSet = set: join: 
-    with builtins; 
+  flattenAttrSet = set: join:
+    with builtins;
     let
       allKeys = builtins.attrNames set;
-      isNested = key: builtins.typeOf (builtins.getAttr key set) == "set";  
-      
+      isNested = key: builtins.typeOf (builtins.getAttr key set) == "set";
+
       nestedElements = builtins.filter isNested allKeys;
       pureElements = builtins.attrNames (builtins.removeAttrs set nestedElements);
     in
       lib.attrsets.mergeAttrsList [
-        # We first process the part with attributes
-        ( lib.genAttrs       (map (it: join + it) pureElements) (it: it) ) 
-        # Then we process the part that requires recursion
-        ( lib.mergeAttrsList (map (it: flattenAttrSet (getAttr it set) "${join}${it}/") nestedElements) ) 
+        ( lib.genAttrs       (map (it: join + it) pureElements) (it: it) )
+        ( lib.mergeAttrsList (map (it: flattenAttrSet (getAttr it set) "${join}${it}/") nestedElements) )
       ];
 
-  readDirRecursive = path: builtins.mapAttrs (file: type: 
-      if type == "directory" then 
-        (readDirRecursive "${path}/${file}")
+  # NOTE: keep `path` typed as a Nix path through the entire recursion.
+  # Using `"${path}/${file}"` would coerce path -> string, importing the
+  # subdirectory into the store and attaching derivation context. That
+  # context then fails to realise inside `nix flake check --no-build`:
+  #     path '/nix/store/<hash>-etc' is not valid
+  # `path + ("/" + file)` preserves the path type and operates directly
+  # on the filesystem.
+  readDirRecursive = path: builtins.mapAttrs (file: type:
+      if type == "directory" then
+        (readDirRecursive (path + ("/" + file)))
       else file
     ) (builtins.readDir path);
 
@@ -29,40 +34,63 @@ rec {
   listFileRecursive = path: listFileRecursiveRel path "";
 
   mkFileMountsEtc = path: lib.genAttrs (listFileRecursive path) (it: {
-    text = builtins.readFile ((builtins.toString path) + "/" + it);
-  }); 
+    text = builtins.readFile (path + ("/" + it));
+  });
 
-  mkLamaCloudVM = confFactory: let 
+  # mkLamaCloudVM :: (pkgs -> attrset) -> spec
+  #
+  # Returns a *spec* describing the host. The flake materialises specs into
+  # both `nixosConfigurations.<name>` (via `nixpkgs.lib.nixosSystem`) and
+  # `colmenaHive` nodes. Hosts therefore have ONE source of truth and the
+  # two output paths cannot drift.
+  #
+  # Spec shape:
+  #   { hostName    :: string
+  #   , system      :: string         # e.g. "x86_64-linux"
+  #   , pkgs        :: nixpkgs        # initialised with overlays
+  #   , modules     :: [module]       # ready to feed nixosSystem / Colmena
+  #   }
+  mkLamaCloudVM = confFactory: let
     probe = confFactory null;
+    system = probe.target-arch or "x86_64-linux";
+
     pkgs = import nixpkgs {
       overlays = [ (import ../packages) ];
-      system = probe.target-arch;
+      inherit system;
       config = {
         allowUnfree = true;
       };
     };
     conf = confFactory pkgs;
 
-    hostFile = path: "${conf.config-root}/${path}";
-    readJSON = path: builtins.fromJSON (builtins.readFile path );
+    # NOTE: `hostFile` must return a Nix *path*, not a string. Path-to-string
+    # interpolation (`"${conf.config-root}/..."`) imports the entire host
+    # directory into the Nix store and attaches store *context* to the
+    # resulting string. `builtins.pathExists` then has to realise that
+    # context, which fails inside `nix flake check --no-build` with:
+    #     path '/nix/store/<hash>-<hostName>' is not valid
+    # Using `path + "/relative"` keeps the value typed as `path` and lets
+    # `pathExists`/`readFile`/`readDir` operate directly on the filesystem.
+    hostFile = subpath: conf.config-root + ("/" + subpath);
+    readJSON = path: builtins.fromJSON (builtins.readFile path);
     etcFolder = hostFile "files/etc";
 
-    applyEtcMapping = { pkgs, ... }: {
+    applyEtcMapping = { ... }: {
       environment = {
-        etc = if builtins.pathExists etcFolder then 
-                mkFileMountsEtc etcFolder 
+        etc = if builtins.pathExists etcFolder then
+                mkFileMountsEtc etcFolder
               else {};
       };
     };
 
-    applyCreds = { pkgs, ... }: 
+    applyCreds = { ... }:
       if !builtins.pathExists (hostFile "creds.json") then
-        throw "Missing credentials! Generate with 'lamacloud creds new ${conf.hostName}'"
+        throw "Missing credentials for '${conf.hostName}'! Generate with 'lamacloud creds new ${conf.hostName}'"
       else if !builtins.pathExists ../sayo.json then
-        throw "Missing CI Credentials! Generate with 'lamacloud creds new --sayo'"
+        throw "Missing CI credentials! Generate with 'lamacloud creds new --sayo'"
       else let
         elaina = readJSON (hostFile "creds.json");
-        sayo = readJSON ../sayo.json; # Global CI Credentials
+        sayo = readJSON ../sayo.json;
       in {
         users.users.elaina.hashedPassword = elaina.elaina.hashedPassword;
         users.users.elaina.openssh.authorizedKeys = elaina.elaina.publicKey;
@@ -71,26 +99,30 @@ rec {
         users.users.sayo.openssh.authorizedKeys = sayo.publicKey;
       };
 
-    applyParts = { pkgs, ... }:
+    # partition.json is now OPTIONAL. Hosts without one skip disko entirely
+    # (useful for VM-deployable test fixtures and bare-metal hosts whose
+    # disk layout is already final). Hosts that DO ship a partition.json
+    # continue to feed disko exactly as before.
+    applyParts = { ... }:
       if !builtins.pathExists (hostFile "partition.json") then
-        throw "Missing partition file! Generate with 'lamacloud part ${conf.hostName}'"
-      else let 
-        json = readJSON (hostFile "partition.json"); 
+        { disko.enableConfig = false; }
+      else let
+        json = readJSON (hostFile "partition.json");
       in {
         disko.enableConfig = true;
-        disko.devices.disk = pkgs.lib.genAttrs (builtins.attrNames json) (it: 
-          let 
-            disk = builtins.getAttr it json; 
+        disko.devices.disk = pkgs.lib.genAttrs (builtins.attrNames json) (it:
+          let
+            disk = builtins.getAttr it json;
           in {
             device = it;
             type = "disk";
             content = {
               type = "gpt";
-              partitions = pkgs.lib.genAttrs (builtins.attrNames disk) (partName: 
+              partitions = pkgs.lib.genAttrs (builtins.attrNames disk) (partName:
                 let
                   part = builtins.getAttr partName disk;
-                in 
-                  if part.role == "rootfs" then 
+                in
+                  if part.role == "rootfs" then
                     {
                       size = part.size;
                       content = {
@@ -129,28 +161,31 @@ rec {
                       };
                     }
                   else
-                  throw "Unsupported partition role! lamacloud.nix is out-of-date!"
+                  throw "Unsupported partition role '${part.role}'! lamacloud.nix is out-of-date!"
               );
             };
-          }); 
+          });
       };
 
-  in nixpkgs.lib.nixosSystem {
-    system = conf.target-arch or "x86_64-linux";
-
     modules = [
-      # Server base template
       ./foundation.nix
 
-      # Apply generated config
       applyEtcMapping
       applyCreds
       applyParts
-     
+
       disko.nixosModules.disko
 
-      # Make actual config from abbr version
-      (aliasFactory.apply (builtins.removeAttrs conf ["target-arch"]))
+      (aliasFactory.apply (builtins.removeAttrs conf [ "target-arch" ]))
     ];
+  in {
+    inherit (conf) hostName;
+    inherit system pkgs modules;
   };
-}) 
+
+  # Build a `nixpkgs.lib.nixosSystem` from a spec returned by `mkLamaCloudVM`.
+  # Kept as a separate function so callers (flake.nix, nix-debug) share logic.
+  evalSpec = spec: nixpkgs.lib.nixosSystem {
+    inherit (spec) system modules;
+  };
+})

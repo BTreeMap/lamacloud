@@ -2,7 +2,7 @@
 
   WARNING: This file is AI generated without any review. Use at your own's risk.
 
-*/ 
+*/
 
 import fs from 'fs'
 import os from 'os'
@@ -26,8 +26,12 @@ let
   lamacloud = import (root + "/foundation/lamacloud.nix") {
     inherit (flake.inputs) nixpkgs disko;
   };
+  spec = import (root + "/hosts/${host}/configuration.nix") {
+    inherit (flake.inputs) nixpkgs;
+    inherit lamacloud;
+  };
 in
-  (import (root + "/hosts/${host}/configuration.nix") { inherit lamacloud; }).config.system.build.toplevel
+  (lamacloud.evalSpec spec).config.system.build.toplevel
 `
 }
 
