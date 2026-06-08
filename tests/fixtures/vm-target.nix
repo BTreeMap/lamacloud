@@ -21,20 +21,30 @@
 
     # Port-forward the guest sshd to host:2222. The fixture lamacloud.json
     # points lc-ci-fixture -> 127.0.0.1:2222 so the runner can connect.
+    # Bind explicitly to 127.0.0.1 on the host so the forward never clashes
+    # with anything else bound on 0.0.0.0:2222.
     forwardPorts = [
-      { from = "host"; host.port = 2222; guest.port = 22; }
+      { from = "host"; host.address = "127.0.0.1"; host.port = 2222; guest.port = 22; }
     ];
   };
 
   networking.hostName = "lc-ci-fixture";
+  # Firewall disabled belt-and-suspenders; openssh.openFirewall also set
+  # so that re-enabling the firewall later doesn't silently break SSH.
   networking.firewall.enable = false;
 
   services.openssh = {
     enable = true;
+    openFirewall = true;
     settings = {
       PasswordAuthentication = false;
       PermitRootLogin = "no";
     };
+    # Explicit listen address removes any ambiguity about IPv6-only binding
+    # behaviour that could prevent QEMU usermode forwarding from reaching us.
+    listenAddresses = [
+      { addr = "0.0.0.0"; port = 22; }
+    ];
   };
 
   users.users.sayo = {
@@ -57,8 +67,37 @@
     trusted-users = [ "root" "sayo" ];
   };
 
-  # The deployed lc-ci-fixture writes /etc/lamacloud-ci-marker; we leave
-  # nothing here in /etc that would shadow it.
+  # Definitive readiness marker.
+  #
+  # The host-side `deploy-vm.sh` tails the VM serial log for the exact
+  # token below. When seen, sshd is guaranteed to be accepting connections.
+  # This eliminates the previous race between "sshd has started" (which
+  # systemd reports as soon as the unit is forked) and "sshd is actually
+  # listening on port 22" (which can lag by a couple of seconds).
+  systemd.services.lc-ci-ready = {
+    description = "Emit lc-ci-fixture VM readiness marker";
+    wantedBy = [ "multi-user.target" ];
+    after = [ "sshd.service" "network-online.target" ];
+    requires = [ "sshd.service" ];
+    serviceConfig = {
+      Type = "oneshot";
+      RemainAfterExit = true;
+      # Poll until sshd actually accepts a TCP connection before emitting.
+      ExecStart = pkgs.writeShellScript "lc-ci-ready" ''
+        set -eu
+        for _ in $(seq 1 60); do
+          if ${pkgs.iproute2}/bin/ss -tln 'sport = :22' | ${pkgs.gnugrep}/bin/grep -q ':22'; then
+            echo "===LC_CI_VM_SSH_READY===" >/dev/console
+            echo "===LC_CI_VM_SSH_READY===" >/dev/ttyS0 2>/dev/null || true
+            exit 0
+          fi
+          sleep 1
+        done
+        echo "===LC_CI_VM_SSH_FAILED===" >/dev/console
+        exit 1
+      '';
+    };
+  };
 
   system.stateVersion = "25.11";
 }

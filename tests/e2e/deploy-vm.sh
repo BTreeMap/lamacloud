@@ -2,12 +2,16 @@
 # Full e2e deploy test.
 #
 # 1. Build the bootstrap NixOS VM (`packages.x86_64-linux.ci-target-vm`).
-# 2. Boot it in the background with SSH port-forwarded to host:2222.
-# 3. Wait for sshd to accept the fixture sayo key.
-# 4. Build the lc-ci-fixture closure via Colmena and apply `switch` to
+# 2. Boot it in the background with SSH port-forwarded to 127.0.0.1:2222.
+# 3. Wait for the readiness marker `===LC_CI_VM_SSH_READY===` on the VM
+#    serial console (emitted by the `lc-ci-ready` systemd unit declared
+#    in tests/fixtures/vm-target.nix). This is the AUTHORITATIVE signal
+#    that sshd is accepting connections.
+# 4. Probe SSH with the fixture sayo key as a secondary confirmation.
+# 5. Build the lc-ci-fixture closure via Colmena and apply `switch` to
 #    the running VM (over ssh, using the fixture lamacloud.json mapping).
-# 5. SSH back in and assert /etc/lamacloud-ci-marker == "deployed-via-colmena".
-# 6. Tear the VM down whether the test passed or failed.
+# 6. SSH back in and assert /etc/lamacloud-ci-marker == "deployed-via-colmena".
+# 7. Tear the VM down whether the test passed or failed.
 #
 # Designed to be invoked by `.github/workflows/e2e-deploy.yml`.
 # Requires: nix, colmena, qemu-system-x86_64, ssh, nc.
@@ -26,20 +30,35 @@ VM_LOG="$REPO_ROOT/tests/e2e/.vm.log"
 VM_STATE="$REPO_ROOT/tests/e2e/.vm-state"
 VM_PID=""
 
+# Tunable timeouts (CI runners with cold nix caches are slow).
+VM_BOOT_TIMEOUT="${LC_VM_BOOT_TIMEOUT:-420}"   # secs to wait for readiness marker
+VM_SSH_TIMEOUT="${LC_VM_SSH_TIMEOUT:-60}"      # secs to wait for ssh after marker
+
+# ---------------------------------------------------------------------- cleanup
 cleanup() {
+  local exit_code=$?
+
+  if [[ "$exit_code" -ne 0 && -f "$VM_LOG" ]]; then
+    lc_info "cleanup: full VM log (last 200 lines)"
+    tail -n 200 "$VM_LOG" | sed 's/^/[vm]    /' || true
+
+    lc_info "cleanup: host networking snapshot"
+    ss -tlnp 2>/dev/null | sed 's/^/[ss]    /' || true
+  elif [[ -f "$VM_LOG" ]]; then
+    lc_info "cleanup: tail of VM log (last 30 lines, success)"
+    tail -n 30 "$VM_LOG" | sed 's/^/[vm]    /' || true
+  fi
+
   if [[ -n "$VM_PID" ]] && kill -0 "$VM_PID" 2>/dev/null; then
     lc_info "cleanup: terminating VM pid=$VM_PID"
-    kill -TERM "$VM_PID" 2>/dev/null || true
+    # Kill the entire process group so qemu (a grandchild of the subshell)
+    # also dies. PGID == PID for the backgrounded subshell.
+    kill -TERM -- "-$VM_PID" 2>/dev/null || kill -TERM "$VM_PID" 2>/dev/null || true
     for _ in 1 2 3 4 5; do
       kill -0 "$VM_PID" 2>/dev/null || break
       sleep 1
     done
-    kill -KILL "$VM_PID" 2>/dev/null || true
-  fi
-
-  if [[ -f "$VM_LOG" ]]; then
-    lc_info "cleanup: tail of VM log"
-    tail -n 60 "$VM_LOG" | sed 's/^/[vm]    /' || true
+    kill -KILL -- "-$VM_PID" 2>/dev/null || kill -KILL "$VM_PID" 2>/dev/null || true
   fi
 }
 trap cleanup EXIT
@@ -58,66 +77,120 @@ if ! nix build .#ci-target-vm --out-link "$VM_STATE-link" --show-trace 2>&1; the
   lc_fail "deploy-vm/build-vm" "nix build of ci-target-vm failed"
 fi
 
-# qemu-vm.nix produces `bin/run-<hostname>-vm` as a SYMLINK (not a regular
-# file), so `find -type f` would miss it. `-L` makes find follow symlinks
-# and treat the target as the entry's type, after which `-type f` matches
-# the underlying script. Diagnostic listing is emitted so failures are
-# self-explanatory in the workflow log.
+# qemu-vm.nix exposes `bin/run-<hostname>-vm` as a symlink. `find -L`
+# follows it so `-type f` matches the underlying script.
 if ! VM_RUNNER="$(find -L "$VM_STATE-link/bin" -maxdepth 1 -type f -name 'run-*-vm' 2>/dev/null | head -n1)" || [[ -z "$VM_RUNNER" ]]; then
-  lc_info "deploy-vm/build-vm: contents of $VM_STATE-link"
-  ls -la "$VM_STATE-link/" 2>&1 | sed 's/^/  /' || true
   lc_info "deploy-vm/build-vm: contents of $VM_STATE-link/bin"
   ls -la "$VM_STATE-link/bin/" 2>&1 | sed 's/^/  /' || true
   lc_fail "deploy-vm/build-vm" "no run-*-vm script under $VM_STATE-link/bin"
 fi
-
 [[ -x "$VM_RUNNER" ]] || lc_fail "deploy-vm/build-vm" "VM runner '$VM_RUNNER' is not executable"
-lc_info "deploy-vm/build-vm: runner = $VM_RUNNER"
+
+# Echo the qemu command embedded in the runner so we can diagnose any
+# port-forward / network misconfiguration directly from the workflow log.
+lc_info "deploy-vm/build-vm: runner script (qemu invocation)"
+grep -E '(^| )(exec |qemu-system|hostfwd|forwardPorts)' "$VM_RUNNER" 2>/dev/null | sed 's/^/  /' || true
 lc_ok "deploy-vm/build-vm"
+
+# ---------------------------------------------------------------------- pre-flight host port
+lc_banner "deploy-vm: host TCP/2222 pre-flight"
+if ss -tln 'sport = :2222' 2>/dev/null | grep -q ':2222'; then
+  lc_info "deploy-vm/preflight: WARNING - something is already listening on :2222"
+  ss -tlnp 2>/dev/null | grep ':2222' | sed 's/^/  /' || true
+  # Don't fail - QEMU may still be able to bind explicitly to 127.0.0.1.
+fi
+lc_ok "deploy-vm/preflight"
 
 # ---------------------------------------------------------------------- boot VM
 lc_banner "deploy-vm: booting VM (background)"
-# A clean qcow2 every run -- isolates state and prevents stale rootfs.
 mkdir -p "$VM_STATE"
 rm -f "$VM_STATE/disk.qcow2"
 
-(
-  NIX_DISK_IMAGE="$VM_STATE/disk.qcow2" \
-  TMPDIR="$VM_STATE" \
-  "$VM_RUNNER" -nographic </dev/null >"$VM_LOG" 2>&1
-) &
+# `setsid` puts the child in a new session/process group so cleanup can
+# kill the whole tree (subshell -> bash runner -> qemu).
+setsid bash -c "
+  NIX_DISK_IMAGE='$VM_STATE/disk.qcow2' \\
+  TMPDIR='$VM_STATE' \\
+  '$VM_RUNNER' -nographic </dev/null >'$VM_LOG' 2>&1
+" &
 VM_PID=$!
-lc_info "deploy-vm/boot: VM pid=$VM_PID, disk=$VM_STATE/disk.qcow2"
+lc_info "deploy-vm/boot: VM pid=$VM_PID (pgid=$VM_PID), disk=$VM_STATE/disk.qcow2"
 
-# ---------------------------------------------------------------------- wait ssh
-lc_banner "deploy-vm: waiting for sshd on 127.0.0.1:2222"
-SSH_DEADLINE=$((SECONDS + 240))
-SSH_READY=0
+# ---------------------------------------------------------------------- wait readiness
+lc_banner "deploy-vm: waiting up to ${VM_BOOT_TIMEOUT}s for readiness marker"
+READY_DEADLINE=$((SECONDS + VM_BOOT_TIMEOUT))
+SAW_MARKER=0
 
-while (( SECONDS < SSH_DEADLINE )); do
+while (( SECONDS < READY_DEADLINE )); do
   if ! kill -0 "$VM_PID" 2>/dev/null; then
-    lc_fail "deploy-vm/wait-ssh" "VM process died before sshd became reachable; see VM log above"
+    lc_fail "deploy-vm/wait-ready" "VM process died before emitting readiness marker"
   fi
 
-  if nc -z 127.0.0.1 2222 2>/dev/null; then
-    # Port is open; try a real SSH connection to confirm sshd is actually ready.
-    if ssh -i "$SSH_KEY" \
-           -o StrictHostKeyChecking=no \
-           -o UserKnownHostsFile=/dev/null \
-           -o LogLevel=ERROR \
-           -o ConnectTimeout=5 \
-           -o PreferredAuthentications=publickey \
-           -p 2222 sayo@127.0.0.1 'true' 2>/dev/null; then
-      SSH_READY=1
-      break
-    fi
+  if [[ -f "$VM_LOG" ]] && grep -q '===LC_CI_VM_SSH_READY===' "$VM_LOG" 2>/dev/null; then
+    SAW_MARKER=1
+    break
+  fi
+
+  if [[ -f "$VM_LOG" ]] && grep -q '===LC_CI_VM_SSH_FAILED===' "$VM_LOG" 2>/dev/null; then
+    lc_fail "deploy-vm/wait-ready" "VM emitted ===LC_CI_VM_SSH_FAILED=== (sshd never opened :22 inside guest)"
+  fi
+
+  # Periodic diagnostic every ~30s so a hanging boot is debuggable from
+  # the workflow log without needing the artifact.
+  if (( (SECONDS - (READY_DEADLINE - VM_BOOT_TIMEOUT)) % 30 == 0 )); then
+    lc_info "deploy-vm/wait-ready: elapsed=$((SECONDS - (READY_DEADLINE - VM_BOOT_TIMEOUT)))s; last 5 VM log lines:"
+    tail -n 5 "$VM_LOG" 2>/dev/null | sed 's/^/  [vm] /' || true
   fi
 
   sleep 3
 done
 
-(( SSH_READY == 1 )) || lc_fail "deploy-vm/wait-ssh" "ssh did not become ready within timeout"
-lc_ok "deploy-vm/wait-ssh"
+(( SAW_MARKER == 1 )) || lc_fail "deploy-vm/wait-ready" "did not see ===LC_CI_VM_SSH_READY=== within ${VM_BOOT_TIMEOUT}s"
+lc_ok "deploy-vm/wait-ready"
+
+# ---------------------------------------------------------------------- ssh confirm
+lc_banner "deploy-vm: confirming SSH from host"
+SSH_DEADLINE=$((SECONDS + VM_SSH_TIMEOUT))
+SSH_READY=0
+LAST_SSH_ERR=""
+
+while (( SECONDS < SSH_DEADLINE )); do
+  # Port probe (with explicit short timeout).
+  if ! nc -z -w 2 127.0.0.1 2222 2>/dev/null; then
+    LAST_SSH_ERR="nc -z 127.0.0.1 2222 failed (port not reachable from host)"
+    sleep 2
+    continue
+  fi
+
+  if LAST_SSH_ERR="$(ssh -i "$SSH_KEY" \
+         -o StrictHostKeyChecking=no \
+         -o UserKnownHostsFile=/dev/null \
+         -o LogLevel=ERROR \
+         -o ConnectTimeout=5 \
+         -o PreferredAuthentications=publickey \
+         -o BatchMode=yes \
+         -p 2222 sayo@127.0.0.1 'echo lc-ci-ssh-ok' 2>&1)"; then
+    if [[ "$LAST_SSH_ERR" == *"lc-ci-ssh-ok"* ]]; then
+      SSH_READY=1
+      break
+    fi
+  fi
+  sleep 2
+done
+
+if (( SSH_READY != 1 )); then
+  lc_info "deploy-vm/ssh-confirm: last error was: $LAST_SSH_ERR"
+  lc_info "deploy-vm/ssh-confirm: ssh -vvv attempt for diagnosis"
+  ssh -i "$SSH_KEY" \
+      -o StrictHostKeyChecking=no \
+      -o UserKnownHostsFile=/dev/null \
+      -o ConnectTimeout=5 \
+      -o BatchMode=yes \
+      -vvv \
+      -p 2222 sayo@127.0.0.1 'true' 2>&1 | sed 's/^/  [ssh] /' || true
+  lc_fail "deploy-vm/ssh-confirm" "ssh did not succeed within ${VM_SSH_TIMEOUT}s after readiness marker"
+fi
+lc_ok "deploy-vm/ssh-confirm"
 
 # ---------------------------------------------------------------------- ssh cfg
 lc_banner "deploy-vm: generating ssh_config for Colmena"

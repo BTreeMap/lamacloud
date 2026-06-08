@@ -1,0 +1,173 @@
+name: deploy-prod
+
+# Real production deployment from CI.
+#
+# Manually triggered (workflow_dispatch). Pushes the current commit's
+# closure to live lamacloud hosts using Colmena over SSH, authenticated
+# with the `sayo` user and the ed25519 private key stored as a GitHub
+# Actions encrypted secret.
+#
+# REQUIRED SECRETS (configure in repo Settings -> Secrets and variables
+# -> Actions). See `docs/CI_DEPLOY.md` for the exact format of each
+# secret -- do not paste anything else here:
+#
+#   LAMACLOUD_SAYO_PRIVATE_KEY   - PEM-formatted ed25519 private key for `sayo`
+#   LAMACLOUD_SSH_KNOWN_HOSTS    - known_hosts entries for every target host
+#
+# Optional inputs let the operator override the Colmena selector (`--on`)
+# and the activation goal (`switch`, `boot`, `dry-activate`, `test`).
+#
+# Safety guard: this workflow refuses to run on a dirty working tree --
+# the commit being deployed must exist verbatim in git.
+
+on:
+  workflow_dispatch:
+    inputs:
+      selector:
+        description: "Colmena --on selector (host name, glob, or @tag). Default = @lamacloud (every host)."
+        required: false
+        default: '@lamacloud'
+        type: string
+      goal:
+        description: "Activation goal."
+        required: true
+        default: 'switch'
+        type: choice
+        options:
+          - switch
+          - boot
+          - test
+          - dry-activate
+      reboot:
+        description: "Reboot nodes after activation."
+        required: false
+        default: false
+        type: boolean
+      confirm:
+        description: "Type 'I UNDERSTAND' to acknowledge this is a production deploy."
+        required: true
+        type: string
+
+concurrency:
+  # Serialize prod deploys -- never allow two simultaneous deploys.
+  group: deploy-prod-global
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: colmena apply ${{ inputs.goal }} --on ${{ inputs.selector }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    # Environment-scoped secrets and required reviewers. Create a GitHub
+    # environment named `production` in repo Settings and protect it with
+    # required reviewers if you want manual approval on top of the inputs.
+    environment: production
+
+    steps:
+      - name: Confirm operator intent
+        if: ${{ inputs.confirm != 'I UNDERSTAND' }}
+        run: |
+          echo "[FAIL]  deploy-prod/confirm: operator did not type 'I UNDERSTAND'"
+          exit 1
+
+      - uses: actions/checkout@v4
+
+      - name: Refuse dirty working tree
+        run: |
+          if [[ -n "$(git status --porcelain)" ]]; then
+            echo "[FAIL]  deploy-prod/clean-tree: working tree is dirty after checkout"
+            git status --short
+            exit 1
+          fi
+          echo "[OK]    deploy-prod/clean-tree"
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+
+      - name: Install Colmena (from pinned flake input)
+        run: |
+          echo "==> installing colmena built from the pinned flake input"
+          nix profile install .#colmena
+          which colmena
+          colmena --version
+
+      # ----------------------------------------------------------- secrets
+      - name: Materialise SSH credentials
+        env:
+          SAYO_PRIVATE_KEY: ${{ secrets.LAMACLOUD_SAYO_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.LAMACLOUD_SSH_KNOWN_HOSTS }}
+        run: |
+          set -eu
+          if [[ -z "${SAYO_PRIVATE_KEY:-}" ]]; then
+            echo "[FAIL]  deploy-prod/secrets: LAMACLOUD_SAYO_PRIVATE_KEY is unset"
+            echo "        See docs/CI_DEPLOY.md for the required format."
+            exit 1
+          fi
+          if [[ -z "${SSH_KNOWN_HOSTS:-}" ]]; then
+            echo "[FAIL]  deploy-prod/secrets: LAMACLOUD_SSH_KNOWN_HOSTS is unset"
+            echo "        See docs/CI_DEPLOY.md for the required format."
+            exit 1
+          fi
+
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          # Write the key. The secret MUST end with a trailing newline (the
+          # documented format adds it via `cat key.pem | gh secret set`).
+          printf '%s\n' "$SAYO_PRIVATE_KEY" > ~/.ssh/sayo
+          chmod 600 ~/.ssh/sayo
+
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+          cat >~/.ssh/lamacloud_config <<'EOF'
+          Host *
+            User sayo
+            IdentityFile ~/.ssh/sayo
+            IdentitiesOnly yes
+            UserKnownHostsFile ~/.ssh/known_hosts
+            StrictHostKeyChecking yes
+            ServerAliveInterval 30
+            ServerAliveCountMax 4
+          EOF
+          chmod 600 ~/.ssh/lamacloud_config
+
+          echo "[OK]    deploy-prod/secrets: SSH credentials installed"
+
+      # ----------------------------------------------------------- verify
+      - name: Repository integrity check
+        run: ./foundation/scripts/lamacloud check --strict
+
+      - name: Build hive without pushing (sanity check)
+        env:
+          SSH_CONFIG_FILE: /home/runner/.ssh/lamacloud_config
+        run: |
+          echo "==> colmena build --on '${{ inputs.selector }}'"
+          colmena build --on '${{ inputs.selector }}' --show-trace
+
+      # ----------------------------------------------------------- deploy
+      - name: colmena apply
+        env:
+          SSH_CONFIG_FILE: /home/runner/.ssh/lamacloud_config
+        run: |
+          set -e
+          args=(apply '${{ inputs.goal }}' --on '${{ inputs.selector }}' --verbose)
+          if [[ '${{ inputs.reboot }}' == 'true' ]]; then
+            args+=(--reboot)
+          fi
+          echo "==> colmena ${args[*]}"
+          colmena "${args[@]}"
+
+      - name: Deployment summary
+        if: always()
+        run: |
+          echo "==> deploy-prod outcome: ${{ job.status }}"
+          echo "    selector: ${{ inputs.selector }}"
+          echo "    goal:     ${{ inputs.goal }}"
+          echo "    reboot:   ${{ inputs.reboot }}"
+          echo "    commit:   ${{ github.sha }}"
