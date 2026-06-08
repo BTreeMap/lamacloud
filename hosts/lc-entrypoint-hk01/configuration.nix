@@ -21,4 +21,21 @@
     "net.ipv4.ip_forward" = 1;
     "net.ipv6.conf.all.forwarding" = 1;
   };
+
+  networking.firewall = {
+    trustedInterfaces = [ "tailscale0" ];
+    checkReversePath = "loose"; 
+  };
+
+  services.tailscale = {
+    enable = true;
+    port = 41641;
+    openFirewall = true;
+    useRoutingFeatures = "server";
+    extraSetFlags = [
+      "--ssh"
+      "--advertise-exit-node"
+      "--webclient"
+    ];
+  };
 })
