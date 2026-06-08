@@ -58,8 +58,20 @@ if ! nix build .#ci-target-vm --out-link "$VM_STATE-link" --show-trace 2>&1; the
   lc_fail "deploy-vm/build-vm" "nix build of ci-target-vm failed"
 fi
 
-VM_RUNNER="$(find "$VM_STATE-link/bin" -maxdepth 1 -type f -name 'run-*-vm' | head -n1)"
-[[ -x "$VM_RUNNER" ]] || lc_fail "deploy-vm/build-vm" "no runnable VM script under $VM_STATE-link/bin"
+# qemu-vm.nix produces `bin/run-<hostname>-vm` as a SYMLINK (not a regular
+# file), so `find -type f` would miss it. `-L` makes find follow symlinks
+# and treat the target as the entry's type, after which `-type f` matches
+# the underlying script. Diagnostic listing is emitted so failures are
+# self-explanatory in the workflow log.
+if ! VM_RUNNER="$(find -L "$VM_STATE-link/bin" -maxdepth 1 -type f -name 'run-*-vm' 2>/dev/null | head -n1)" || [[ -z "$VM_RUNNER" ]]; then
+  lc_info "deploy-vm/build-vm: contents of $VM_STATE-link"
+  ls -la "$VM_STATE-link/" 2>&1 | sed 's/^/  /' || true
+  lc_info "deploy-vm/build-vm: contents of $VM_STATE-link/bin"
+  ls -la "$VM_STATE-link/bin/" 2>&1 | sed 's/^/  /' || true
+  lc_fail "deploy-vm/build-vm" "no run-*-vm script under $VM_STATE-link/bin"
+fi
+
+[[ -x "$VM_RUNNER" ]] || lc_fail "deploy-vm/build-vm" "VM runner '$VM_RUNNER' is not executable"
 lc_info "deploy-vm/build-vm: runner = $VM_RUNNER"
 lc_ok "deploy-vm/build-vm"
 
