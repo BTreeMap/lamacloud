@@ -27,7 +27,7 @@ rec {
   listFileRecursive = path: listFileRecursiveRel path "";
 
   mkFileMountsEtc = path: lib.genAttrs (listFileRecursive path) (it: {
-    text = builtins.readFile ((builtins.toString path) + "/" + it);
+    text = builtins.readFile (path + ("/" + it));
   });
 
   # mkLamaCloudVM :: (pkgs -> attrset) -> spec
@@ -56,7 +56,15 @@ rec {
     };
     conf = confFactory pkgs;
 
-    hostFile = path: "${conf.config-root}/${path}";
+    # NOTE: `hostFile` must return a Nix *path*, not a string. Path-to-string
+    # interpolation (`"${conf.config-root}/..."`) imports the entire host
+    # directory into the Nix store and attaches store *context* to the
+    # resulting string. `builtins.pathExists` then has to realise that
+    # context, which fails inside `nix flake check --no-build` with:
+    #     path '/nix/store/<hash>-<hostName>' is not valid
+    # Using `path + "/relative"` keeps the value typed as `path` and lets
+    # `pathExists`/`readFile`/`readDir` operate directly on the filesystem.
+    hostFile = subpath: conf.config-root + ("/" + subpath);
     readJSON = path: builtins.fromJSON (builtins.readFile path);
     etcFolder = hostFile "files/etc";
 
