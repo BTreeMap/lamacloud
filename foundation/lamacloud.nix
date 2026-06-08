@@ -17,9 +17,16 @@ rec {
         ( lib.mergeAttrsList (map (it: flattenAttrSet (getAttr it set) "${join}${it}/") nestedElements) )
       ];
 
+  # NOTE: keep `path` typed as a Nix path through the entire recursion.
+  # Using `"${path}/${file}"` would coerce path -> string, importing the
+  # subdirectory into the store and attaching derivation context. That
+  # context then fails to realise inside `nix flake check --no-build`:
+  #     path '/nix/store/<hash>-etc' is not valid
+  # `path + ("/" + file)` preserves the path type and operates directly
+  # on the filesystem.
   readDirRecursive = path: builtins.mapAttrs (file: type:
       if type == "directory" then
-        (readDirRecursive "${path}/${file}")
+        (readDirRecursive (path + ("/" + file)))
       else file
     ) (builtins.readDir path);
 
