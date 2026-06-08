@@ -1,0 +1,10 @@
+{
+    "elaina": {
+        "hashedPassword": "$6$yz0swfv46JmobR/y$3bJfvl9Q3PNgGlpGhhDGCJkBMuSYuY9UJHnaGbxK78y8z9dSQMMV0yUsh6tZPlODiiRievwhyEV3PBycMWL1W/",
+        "publicKey": {
+            "keys": [
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFL4mcFkmYF0Pwnhrz2R3ZwLuCXflI9g4+X2vnpQKUFV elaina@lc-ci-fixture"
+            ]
+        }
+    }
+}

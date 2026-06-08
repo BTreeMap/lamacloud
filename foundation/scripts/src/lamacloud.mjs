@@ -10,6 +10,7 @@ import { registerProbe } from './commands/probe.mjs'
 import { registerCreds } from './commands/creds.mjs'
 import { registerNixDebug } from './commands/nix-debug.mjs'
 import { registerBuild } from './commands/build.mjs'
+import { registerCheck } from './commands/check.mjs'
 
 program.name("lamacloud")
   .description("lamacloud host os management helper")
@@ -26,6 +27,7 @@ registerDeploy(program)
 registerProbe(program)
 registerNixDebug(program)
 registerBuild(program)
+registerCheck(program)
 
 const argv = process.argv
 const scriptIndex = argv.findLastIndex((arg) => /(^|\/)lamacloud(\.mjs)?$/.test(arg))

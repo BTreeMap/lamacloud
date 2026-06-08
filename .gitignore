@@ -3,6 +3,11 @@
 **/*.key
 **/*.pem
 
+# Fixture keys for CI must be committed - they are throwaway artifacts
+# authorizing access only to a transient QEMU VM created by GitHub Actions.
+!tests/fixtures/*.key
+!tests/fixtures/*.key.pub
+
 # Probe files are not useful after partition is completed, so remove
 **/remote.json
 

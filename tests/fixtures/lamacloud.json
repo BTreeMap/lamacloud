@@ -1,0 +1,10 @@
+{
+    "remotes": {
+        "lc-ci-fixture": {
+            "host": "127.0.0.1",
+            "port": 2222,
+            "user": "sayo",
+            "description": "Throwaway QEMU VM used by GitHub Actions e2e tests"
+        }
+    }
+}

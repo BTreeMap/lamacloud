@@ -1,0 +1,71 @@
+name: e2e-deploy
+
+# End-to-end deploy test:
+#   1. Build a throwaway NixOS VM (`packages.x86_64-linux.ci-target-vm`).
+#   2. Boot it under QEMU with sshd port-forwarded to 127.0.0.1:2222.
+#   3. Use Colmena to deploy `lc-ci-fixture` onto the running VM.
+#   4. Assert `/etc/lamacloud-ci-marker` contains `deployed-via-colmena`.
+#
+# This is the slowest signal in the repo and runs in its own workflow so
+# the fast lanes in ci.yml are not blocked by it.
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: e2e-deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy-vm:
+    name: Deploy lc-ci-fixture to QEMU VM
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+
+      - name: Install runtime tools (qemu, colmena, netcat)
+        run: |
+          echo "==> installing colmena from the pinned flake input"
+          nix profile install .#colmena
+
+          echo "==> installing qemu + nc via apt"
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 \
+            netcat-openbsd
+          which qemu-system-x86_64
+          which nc
+          which colmena
+          colmena --version
+
+      - name: Install CI fixtures
+        env:
+          LAMACLOUD_CI: '1'
+        run: ./tests/e2e/install-fixtures.sh
+
+      - name: Run deploy-vm.sh
+        run: ./tests/e2e/deploy-vm.sh
+
+      - name: Restore real configuration files
+        if: always()
+        run: ./tests/e2e/restore-fixtures.sh
+
+      - name: Upload VM log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vm-log
+          path: tests/e2e/.vm.log
+          if-no-files-found: ignore
