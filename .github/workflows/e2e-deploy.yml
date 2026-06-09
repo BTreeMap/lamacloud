@@ -11,7 +11,7 @@ name: e2e-deploy
 
 on:
   push:
-    branches: ['master', 'main', 'feat/**']
+    branches: ['master', 'main', 'feat/**', 'fix/**']
   pull_request:
     branches: ['master', 'main']
   workflow_dispatch:

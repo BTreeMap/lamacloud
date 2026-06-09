@@ -13,7 +13,7 @@ name: ci
 
 on:
   push:
-    branches: ['master', 'main', 'feat/**']
+    branches: ['master', 'main', 'feat/**', 'fix/**']
   pull_request:
     branches: ['master', 'main']
 
