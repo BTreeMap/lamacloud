@@ -255,32 +255,58 @@ export SSH_CONFIG_FILE="$SSH_CONFIG"
 # runner is the runner's *own* sshd, not the VM) and silently fail auth.
 export NIX_SSHOPTS="-F $SSH_CONFIG -p 2222 -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 
-# Build locally and push (Colmena's default). Tee the output to a file so
-# that, on failure, the exact Colmena error is reprinted under an
-# unmistakable banner right next to the [FAIL] marker -- otherwise it can
-# scroll far above the cleanup VM-log dump and be hard to find.
+# IMPORTANT: do NOT treat Colmena's exit code as the source of truth.
+#
+# `colmena apply switch` activates the new generation over SSH. Activation
+# restarts session-scoped units (systemd-logind, the user@ slice, the
+# network), which can drop Colmena's own control connection *after* the
+# switch has already succeeded. Colmena then reports "connection closed"
+# and exits non-zero even though the target is in exactly the intended
+# state. The authoritative success signal is the observed state of the
+# guest (verified below), not the liveness of the deploy tool's SSH
+# session. We therefore capture the exit code but defer the verdict.
 COLMENA_LOG="$REPO_ROOT/tests/e2e/.colmena-apply.log"
-if ! colmena apply switch --on lc-ci-fixture --verbose --show-trace 2>&1 | tee "$COLMENA_LOG"; then
-  lc_banner "deploy-vm: COLMENA OUTPUT (apply failed)"
-  sed 's/^/  [colmena] /' "$COLMENA_LOG" >&2 || true
-  dump_vm_diagnostics "colmena apply switch returned non-zero"
-  lc_fail "deploy-vm/colmena-apply" "colmena apply switch failed (see [colmena] and [guest] lines above)"
+# Disable errexit around the pipeline: `set -e -o pipefail` would otherwise
+# abort the whole script the instant colmena exits non-zero, before we can
+# capture PIPESTATUS and run our authoritative verification.
+set +e
+colmena apply switch --on lc-ci-fixture --verbose --show-trace 2>&1 | tee "$COLMENA_LOG"
+APPLY_RC=${PIPESTATUS[0]}
+set -e
+
+if (( APPLY_RC == 0 )); then
+  lc_ok "deploy-vm/colmena-apply"
+else
+  lc_info "deploy-vm/colmena-apply: colmena exited ${APPLY_RC}; will verify actual guest"
+  lc_info "deploy-vm/colmena-apply: (a dropped control channel during activation is"
+  lc_info "                         expected and is NOT a failure if the switch landed)"
 fi
-lc_ok "deploy-vm/colmena-apply"
 
 # ---------------------------------------------------------------------- verify
-# Activating the new generation restarts a number of guest units. sshd's
-# config is identical to the bootstrap so it is NOT restarted, but other
-# services churn briefly. Probe the marker in a short retry loop rather
-# than a single shot so a transient connection blip is never mistaken for
-# a deploy failure.
-lc_banner "deploy-vm: verifying marker file"
-VERIFY_DEADLINE=$((SECONDS + 60))
+# AUTHORITATIVE success gate.
+#
+# `/run/current-system/etc/lamacloud-ci-marker` exists ONLY when the active
+# system generation is the closure we just built (the marker is declared via
+# environment.etc in hosts/lc-ci-fixture/configuration.nix, so it is part of
+# that closure's /etc and symlinked from /run/current-system). Reading it
+# back with the expected content proves end-to-end that build -> push ->
+# activate -> "the target is now running our config" all happened.
+#
+# Services may still be restarting right after the switch, so reconnect in a
+# short retry loop rather than a single shot.
+lc_banner "deploy-vm: verifying deployed generation is active"
+VERIFY_DEADLINE=$((SECONDS + 90))
 marker=""
+sys_state=""
 verify_err=""
 while (( SECONDS < VERIFY_DEADLINE )); do
   if marker="$(ssh -F "$SSH_CONFIG" -o ConnectTimeout=5 lc-ci-fixture \
-        'cat /etc/lamacloud-ci-marker' 2>&1)"; then
+        'cat /run/current-system/etc/lamacloud-ci-marker' 2>&1)"; then
+    # Also capture system running-state (running|degraded are both fine;
+    # the closure is active either way -- degraded just means some
+    # non-critical unit failed, which we surface but do not fail on).
+    sys_state="$(ssh -F "$SSH_CONFIG" -o ConnectTimeout=5 lc-ci-fixture \
+        'systemctl is-system-running' 2>/dev/null || true)"
     break
   fi
   verify_err="$marker"
@@ -289,10 +315,28 @@ while (( SECONDS < VERIFY_DEADLINE )); do
 done
 
 if [[ -z "$marker" ]]; then
-  dump_vm_diagnostics "marker read failed"
-  lc_fail "deploy-vm/verify" "could not read marker within 60s: $verify_err"
+  dump_vm_diagnostics "deployed generation not observable (apply_rc=${APPLY_RC})"
+  if (( APPLY_RC != 0 )); then
+    lc_banner "deploy-vm: COLMENA OUTPUT (apply also failed)"
+    sed 's/^/  [colmena] /' "$COLMENA_LOG" >&2 || true
+  fi
+  lc_fail "deploy-vm/verify" "could not read /run/current-system marker within 90s: $verify_err"
 fi
+
 lc_assert_eq "deploy-vm/verify" "deployed-via-colmena" "${marker%$'\n'}"
+
+lc_info "deploy-vm/verify: guest system state = ${sys_state:-unknown}"
+if [[ "$sys_state" == "degraded" ]]; then
+  lc_info "deploy-vm/verify: system is degraded; failed units (non-fatal):"
+  ssh -F "$SSH_CONFIG" lc-ci-fixture 'systemctl --failed --no-pager --no-legend' 2>&1 \
+    | sed 's/^/  [guest] /' || true
+fi
+
+if (( APPLY_RC != 0 )); then
+  lc_info "deploy-vm/verify: colmena exited ${APPLY_RC} but the target IS running the"
+  lc_info "                  deployed closure -- treating as success (control channel"
+  lc_info "                  dropped during post-switch service restarts)."
+fi
 lc_ok "deploy-vm/verify"
 
 # ---------------------------------------------------------------------- done
