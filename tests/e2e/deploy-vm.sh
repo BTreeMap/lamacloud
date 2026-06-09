@@ -208,19 +208,63 @@ EOF
 chmod 600 "$SSH_CONFIG"
 lc_ok "deploy-vm/ssh-config"
 
+# ---------------------------------------------------------------------- guest diagnostics
+# Pull the *guest-side* failure information. The host serial console only
+# shows systemd banners; the actual `switch-to-configuration` / activation
+# error lives in the guest journal. Without this, a failed deploy is a
+# black box and we are reduced to guessing. Called on every failure path.
+dump_vm_diagnostics() {
+  local why="$1"
+  lc_banner "deploy-vm: GUEST DIAGNOSTICS (${why})"
+
+  if ! ssh -F "$SSH_CONFIG" -o ConnectTimeout=5 lc-ci-fixture 'true' 2>/dev/null; then
+    lc_info "guest-diag: SSH to the VM is itself down -- cannot collect guest journal"
+    lc_info "guest-diag: this means the deploy broke sshd or networking on the guest"
+    return 0
+  fi
+
+  lc_info "guest-diag: systemctl --failed"
+  ssh -F "$SSH_CONFIG" lc-ci-fixture \
+    'systemctl --failed --no-pager --no-legend' 2>&1 | sed 's/^/  [guest] /' || true
+
+  lc_info "guest-diag: current system generation"
+  ssh -F "$SSH_CONFIG" lc-ci-fixture \
+    'readlink -f /run/current-system; readlink -f /nix/var/nix/profiles/system' 2>&1 \
+    | sed 's/^/  [guest] /' || true
+
+  lc_info "guest-diag: last 120 journal lines (priority warning+)"
+  ssh -F "$SSH_CONFIG" lc-ci-fixture \
+    'journalctl -b -p warning --no-pager 2>/dev/null | tail -n 120' 2>&1 \
+    | sed 's/^/  [guest] /' || true
+
+  lc_info "guest-diag: sshd unit status"
+  ssh -F "$SSH_CONFIG" lc-ci-fixture \
+    'systemctl status sshd.service --no-pager -l 2>&1 | head -n 25' 2>&1 \
+    | sed 's/^/  [guest] /' || true
+}
+
 # ---------------------------------------------------------------------- deploy
 lc_banner "deploy-vm: colmena apply switch --on lc-ci-fixture"
 export SSH_CONFIG_FILE="$SSH_CONFIG"
+
+# Belt-and-suspenders for Colmena's *internal* nix-copy/activation SSH:
+# Colmena shells out to `ssh`/`nix copy` for the push and activate phases.
+# Those sub-invocations honour SSH_CONFIG_FILE, but `nix copy` uses
+# NIX_SSHOPTS for its transport. Set both explicitly so the closure push
+# can never accidentally fall back to 127.0.0.1:22 (which on a GitHub
+# runner is the runner's *own* sshd, not the VM) and silently fail auth.
+export NIX_SSHOPTS="-F $SSH_CONFIG -p 2222 -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 
 # Build locally and push (Colmena's default). Tee the output to a file so
 # that, on failure, the exact Colmena error is reprinted under an
 # unmistakable banner right next to the [FAIL] marker -- otherwise it can
 # scroll far above the cleanup VM-log dump and be hard to find.
 COLMENA_LOG="$REPO_ROOT/tests/e2e/.colmena-apply.log"
-if ! colmena apply switch --on lc-ci-fixture --verbose 2>&1 | tee "$COLMENA_LOG"; then
-  lc_info "deploy-vm/colmena-apply: full colmena output follows"
+if ! colmena apply switch --on lc-ci-fixture --verbose --show-trace 2>&1 | tee "$COLMENA_LOG"; then
+  lc_banner "deploy-vm: COLMENA OUTPUT (apply failed)"
   sed 's/^/  [colmena] /' "$COLMENA_LOG" >&2 || true
-  lc_fail "deploy-vm/colmena-apply" "colmena apply switch failed (see [colmena] lines above)"
+  dump_vm_diagnostics "colmena apply switch returned non-zero"
+  lc_fail "deploy-vm/colmena-apply" "colmena apply switch failed (see [colmena] and [guest] lines above)"
 fi
 lc_ok "deploy-vm/colmena-apply"
 
@@ -244,7 +288,10 @@ while (( SECONDS < VERIFY_DEADLINE )); do
   sleep 3
 done
 
-[[ -n "$marker" ]] || lc_fail "deploy-vm/verify" "could not read marker within 60s: $verify_err"
+if [[ -z "$marker" ]]; then
+  dump_vm_diagnostics "marker read failed"
+  lc_fail "deploy-vm/verify" "could not read marker within 60s: $verify_err"
+fi
 lc_assert_eq "deploy-vm/verify" "deployed-via-colmena" "${marker%$'\n'}"
 lc_ok "deploy-vm/verify"
 
