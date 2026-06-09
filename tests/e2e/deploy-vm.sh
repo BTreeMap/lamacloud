@@ -212,16 +212,39 @@ lc_ok "deploy-vm/ssh-config"
 lc_banner "deploy-vm: colmena apply switch --on lc-ci-fixture"
 export SSH_CONFIG_FILE="$SSH_CONFIG"
 
-if ! colmena apply switch --on lc-ci-fixture --verbose 2>&1; then
-  lc_fail "deploy-vm/colmena-apply" "colmena apply switch failed"
+# Build locally and push (Colmena's default). Tee the output to a file so
+# that, on failure, the exact Colmena error is reprinted under an
+# unmistakable banner right next to the [FAIL] marker -- otherwise it can
+# scroll far above the cleanup VM-log dump and be hard to find.
+COLMENA_LOG="$REPO_ROOT/tests/e2e/.colmena-apply.log"
+if ! colmena apply switch --on lc-ci-fixture --verbose 2>&1 | tee "$COLMENA_LOG"; then
+  lc_info "deploy-vm/colmena-apply: full colmena output follows"
+  sed 's/^/  [colmena] /' "$COLMENA_LOG" >&2 || true
+  lc_fail "deploy-vm/colmena-apply" "colmena apply switch failed (see [colmena] lines above)"
 fi
 lc_ok "deploy-vm/colmena-apply"
 
 # ---------------------------------------------------------------------- verify
+# Activating the new generation restarts a number of guest units. sshd's
+# config is identical to the bootstrap so it is NOT restarted, but other
+# services churn briefly. Probe the marker in a short retry loop rather
+# than a single shot so a transient connection blip is never mistaken for
+# a deploy failure.
 lc_banner "deploy-vm: verifying marker file"
-marker="$(ssh -F "$SSH_CONFIG" lc-ci-fixture 'cat /etc/lamacloud-ci-marker' 2>&1)" || \
-  lc_fail "deploy-vm/verify" "ssh marker read failed: $marker"
+VERIFY_DEADLINE=$((SECONDS + 60))
+marker=""
+verify_err=""
+while (( SECONDS < VERIFY_DEADLINE )); do
+  if marker="$(ssh -F "$SSH_CONFIG" -o ConnectTimeout=5 lc-ci-fixture \
+        'cat /etc/lamacloud-ci-marker' 2>&1)"; then
+    break
+  fi
+  verify_err="$marker"
+  marker=""
+  sleep 3
+done
 
+[[ -n "$marker" ]] || lc_fail "deploy-vm/verify" "could not read marker within 60s: $verify_err"
 lc_assert_eq "deploy-vm/verify" "deployed-via-colmena" "${marker%$'\n'}"
 lc_ok "deploy-vm/verify"
 

@@ -40,6 +40,10 @@
   services = {
     openssh = {
       enable = true;
+      # Open port 22 in the firewall. Without this, hosts that keep the
+      # default-enabled NixOS firewall would be unreachable over SSH and
+      # Colmena (CI *and* deploy-prod.yml) could never connect.
+      openFirewall = true;
       settings = {
         PasswordAuthentication = false;
         PermitRootLogin = "no";
@@ -51,6 +55,11 @@
     settings = {
       experimental-features = [ "nix-command" "flakes" ];
       auto-optimise-store = true;
+      # Colmena copies locally-built (unsigned) closures to each host through
+      # the nix-daemon. The deploy user must be trusted or the daemon rejects
+      # the paths with "cannot add path ... lacks a signature". `sayo` is the
+      # deploy identity used by both CI and deploy-prod.yml.
+      trusted-users = [ "root" "sayo" ];
     };
 
     gc = {

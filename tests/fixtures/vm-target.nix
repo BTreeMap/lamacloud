@@ -33,6 +33,12 @@
   # so that re-enabling the firewall later doesn't silently break SSH.
   networking.firewall.enable = false;
 
+  # IMPORTANT: keep this sshd block byte-identical to foundation.nix's
+  # `services.openssh`. If the generated sshd_config differs, `colmena apply
+  # switch` regenerates it and RESTARTS sshd mid-deploy -- which can drop
+  # Colmena's own control connection and fail the run. Reachability over the
+  # QEMU port-forward is provided by `networking.firewall.enable = false`
+  # above; `openFirewall` only matters once the firewall is turned back on.
   services.openssh = {
     enable = true;
     openFirewall = true;
@@ -40,11 +46,6 @@
       PasswordAuthentication = false;
       PermitRootLogin = "no";
     };
-    # Explicit listen address removes any ambiguity about IPv6-only binding
-    # behaviour that could prevent QEMU usermode forwarding from reaching us.
-    listenAddresses = [
-      { addr = "0.0.0.0"; port = 22; }
-    ];
   };
 
   users.users.sayo = {
